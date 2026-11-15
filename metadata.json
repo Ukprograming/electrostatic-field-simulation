@@ -1,0 +1,6 @@
+{
+  "name": "静電場・電位シミュレーター",
+  "description": "高校物理の電場・電気力線・電位の等高線をインタラクティブに観察できるシミュレーション教材",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
