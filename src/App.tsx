@@ -4,6 +4,8 @@ import {
   ChargeColumn,
   SimulationModel,
   FieldDisplayMode,
+  InteractionMode,
+  ParticleRunState,
   PRESET_SCENARIOS,
   UNIFORM_PRESET_SCENARIOS,
 } from './physics/electrostatics';
@@ -39,6 +41,8 @@ export default function App() {
   const nextIdCounter = useRef(1);
   const [simulationModel, setSimulationModel] =
     useState<SimulationModel>('point');
+  const [interactionMode, setInteractionMode] =
+    useState<InteractionMode>('edit');
 
   const [activePresetId, setActivePresetId] = useState<string>('single');
   const [charges, setCharges] = useState<PointCharge[]>(() =>
@@ -72,8 +76,34 @@ export default function App() {
   const [showPotentialTint, setShowPotentialTint] = useState<boolean>(false);
   const [snapToInteger, setSnapToInteger] = useState<boolean>(false);
 
+  // Test particle simulation state
+  const [particleAnchor, setParticleAnchor] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const [particleSign, setParticleSign] = useState<1 | -1>(1);
+  const [particleRunState, setParticleRunState] =
+    useState<ParticleRunState>('idle');
+  const [particleResetNonce, setParticleResetNonce] = useState<number>(0);
+  const [showParticleForce, setShowParticleForce] = useState<boolean>(true);
+
+  const handleInteractionModeChange = useCallback((mode: InteractionMode) => {
+    setInteractionMode(mode);
+    if (mode === 'edit') {
+      // Remove placed particle immediately when returning to potential-editing mode
+      setParticleAnchor(null);
+      setParticleRunState('idle');
+      setParticleResetNonce((n) => n + 1);
+    } else {
+      // Lock potential: clear any active source selection
+      setSelectedChargeId(null);
+      setSelectedColumnId(null);
+    }
+  }, []);
+
   const handleLoadPreset = useCallback(
     (presetId: string) => {
+      if (interactionMode === 'particle') return;
       if (simulationModel === 'uniform') {
         const newCols = createInitialColumns(presetId);
         setActiveUniformPresetId(presetId);
@@ -86,16 +116,79 @@ export default function App() {
         setSelectedChargeId(newCharges[0]?.id ?? null);
       }
     },
-    [simulationModel]
+    [interactionMode, simulationModel]
   );
 
+  const handleResetParticle = useCallback(() => {
+    setParticleRunState('idle');
+    setParticleResetNonce((n) => n + 1);
+  }, []);
+
   const handleReset = useCallback(() => {
+    if (interactionMode === 'particle') {
+      handleResetParticle();
+      return;
+    }
     if (simulationModel === 'uniform') {
       handleLoadPreset(activeUniformPresetId);
     } else {
       handleLoadPreset(activePresetId);
     }
-  }, [simulationModel, activePresetId, activeUniformPresetId, handleLoadPreset]);
+  }, [
+    interactionMode,
+    handleResetParticle,
+    simulationModel,
+    activePresetId,
+    activeUniformPresetId,
+    handleLoadPreset,
+  ]);
+
+  const handlePlaceParticle = useCallback((x: number, y: number) => {
+    setParticleAnchor({ x, y });
+    setParticleRunState('idle');
+    setParticleResetNonce((n) => n + 1);
+  }, []);
+
+  const handleParticleSignChange = useCallback(
+    (sign: 1 | -1) => {
+      setParticleSign(sign);
+      if (particleRunState === 'finished') {
+        setParticleRunState('paused');
+      }
+    },
+    [particleRunState]
+  );
+
+  const handleToggleParticleRun = useCallback(() => {
+    if (!particleAnchor) return;
+    setParticleRunState((prev) => {
+      if (prev === 'running') return 'paused';
+      if (prev === 'finished') {
+        setParticleResetNonce((n) => n + 1);
+        return 'running';
+      }
+      return 'running';
+    });
+  }, [particleAnchor]);
+
+  const handleRemoveParticle = useCallback(() => {
+    setParticleAnchor(null);
+    setParticleRunState('idle');
+    setParticleResetNonce((n) => n + 1);
+  }, []);
+
+  const handleParticleFinished = useCallback(() => {
+    setParticleRunState('finished');
+  }, []);
+
+  const handleToggleFieldLines = useCallback(() => {
+    setFieldMode((prev) => {
+      if (prev === 'lines') return 'none';
+      if (prev === 'both') return 'vectors';
+      if (prev === 'vectors') return 'both';
+      return 'lines';
+    });
+  }, []);
 
   const handleMoveCharge = useCallback((id: string, x: number, y: number) => {
     setCharges((prev) =>
@@ -266,18 +359,19 @@ export default function App() {
     simulationModel === 'uniform' &&
     activeUniformPresetId === 'capacitor' &&
     columns.length === 2;
+  const isParticleMode = interactionMode === 'particle';
 
   return (
     <div className="min-h-dvh lg:h-dvh flex flex-col bg-slate-50 text-slate-900">
       {/* Three-Zone Top Bar */}
-      <header className="bg-white border-b border-slate-200 px-4 sm:px-6 h-14 shrink-0 flex items-center justify-between gap-8">
+      <header className="bg-white border-b border-slate-200 px-3 sm:px-6 h-14 shrink-0 flex items-center justify-between gap-3 sm:gap-6">
         <h1 className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
           静電場ラボ
         </h1>
 
         <nav
           aria-label="プリセット"
-          className="hidden md:flex items-center gap-6 overflow-x-auto"
+          className="hidden md:flex items-center gap-5 lg:gap-6 overflow-x-auto"
         >
           {currentPresets.map((preset) => {
             const isActive = preset.id === currentPresetId;
@@ -285,11 +379,16 @@ export default function App() {
               <button
                 key={preset.id}
                 type="button"
+                disabled={isParticleMode}
                 onClick={() => handleLoadPreset(preset.id)}
-                className={`py-2 text-sm font-medium transition-colors whitespace-nowrap shrink-0 border-b-2 cursor-pointer ${
-                  isActive
-                    ? 'text-slate-900 border-slate-900'
-                    : 'text-slate-500 border-transparent hover:text-slate-900'
+                className={`py-2 text-sm font-medium transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+                  isParticleMode
+                    ? isActive
+                      ? 'text-slate-900 border-slate-900 opacity-40 cursor-not-allowed'
+                      : 'text-slate-500 border-transparent opacity-40 cursor-not-allowed'
+                    : isActive
+                      ? 'text-slate-900 border-slate-900 cursor-pointer'
+                      : 'text-slate-500 border-transparent hover:text-slate-900 cursor-pointer'
                 }`}
               >
                 {preset.name}
@@ -298,11 +397,49 @@ export default function App() {
           })}
         </nav>
 
-        <div className="shrink-0">
+        <div className="shrink-0 flex items-center gap-2 sm:gap-3">
+          <div
+            role="tablist"
+            aria-label="操作モード切り替え"
+            className="inline-flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg border border-slate-200/80"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={!isParticleMode}
+              onClick={() => handleInteractionModeChange('edit')}
+              className={`px-2.5 sm:px-3 py-1.5 min-h-[34px] text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                !isParticleMode
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              電場を編集
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={isParticleMode}
+              onClick={() => handleInteractionModeChange('particle')}
+              className={`px-2.5 sm:px-3 py-1.5 min-h-[34px] text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                isParticleMode
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              荷電粒子を置く
+            </button>
+          </div>
+
           <button
             type="button"
+            disabled={isParticleMode && (!particleAnchor || particleRunState === 'idle')}
             onClick={handleReset}
-            className="px-4 py-2 min-h-[38px] text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className={`px-3.5 sm:px-4 py-2 min-h-[38px] text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              isParticleMode && (!particleAnchor || particleRunState === 'idle')
+                ? 'text-slate-400 bg-slate-200 cursor-not-allowed'
+                : 'text-white bg-slate-900 hover:bg-slate-800 cursor-pointer'
+            }`}
           >
             リセット
           </button>
@@ -317,11 +454,16 @@ export default function App() {
             <button
               key={preset.id}
               type="button"
+              disabled={isParticleMode}
               onClick={() => handleLoadPreset(preset.id)}
-              className={`py-1.5 text-xs font-medium whitespace-nowrap shrink-0 border-b-2 cursor-pointer ${
-                isActive
-                  ? 'text-slate-900 border-slate-900'
-                  : 'text-slate-500 border-transparent'
+              className={`py-1.5 text-xs font-medium whitespace-nowrap shrink-0 border-b-2 ${
+                isParticleMode
+                  ? isActive
+                    ? 'text-slate-900 border-slate-900 opacity-40 cursor-not-allowed'
+                    : 'text-slate-500 border-transparent opacity-40 cursor-not-allowed'
+                  : isActive
+                    ? 'text-slate-900 border-slate-900 cursor-pointer'
+                    : 'text-slate-500 border-transparent cursor-pointer'
               }`}
             >
               {preset.name}
@@ -336,6 +478,7 @@ export default function App() {
           <ElectricField3DCanvas
             simulationModel={simulationModel}
             isCapacitorMode={isCapacitorMode}
+            interactionMode={interactionMode}
             charges={charges}
             selectedChargeId={activeSelectedId}
             columns={columns}
@@ -344,16 +487,24 @@ export default function App() {
             showEquipotentials={showEquipotentials}
             showPotentialTint={showPotentialTint}
             snapToInteger={snapToInteger}
+            particleAnchor={particleAnchor}
+            particleSign={particleSign}
+            particleRunState={particleRunState}
+            particleResetNonce={particleResetNonce}
+            showParticleForce={showParticleForce}
             onSelectCharge={setSelectedChargeId}
             onMoveCharge={handleMoveCharge}
             onSelectColumn={setSelectedColumnId}
             onMoveColumn={handleMoveColumn}
+            onPlaceParticle={handlePlaceParticle}
+            onParticleFinished={handleParticleFinished}
           />
         </div>
 
         <ControlDeck
           simulationModel={simulationModel}
           isCapacitorMode={isCapacitorMode}
+          interactionMode={interactionMode}
           charges={charges}
           selectedChargeId={activeSelectedId}
           columns={columns}
@@ -362,8 +513,13 @@ export default function App() {
           showEquipotentials={showEquipotentials}
           showPotentialTint={showPotentialTint}
           snapToInteger={snapToInteger}
+          particleAnchor={particleAnchor}
+          particleSign={particleSign}
+          particleRunState={particleRunState}
+          showParticleForce={showParticleForce}
           onSimulationModelChange={setSimulationModel}
           onFieldModeChange={setFieldMode}
+          onToggleFieldLines={handleToggleFieldLines}
           onToggleEquipotentials={() => setShowEquipotentials((v) => !v)}
           onTogglePotentialTint={() => setShowPotentialTint((v) => !v)}
           onToggleSnap={() => setSnapToInteger((v) => !v)}
@@ -377,9 +533,15 @@ export default function App() {
           onSwapCapacitorPotentials={handleSwapCapacitorPotentials}
           onDeleteColumn={handleDeleteColumn}
           onClearAllColumns={handleClearAllColumns}
+          onParticleSignChange={handleParticleSignChange}
+          onToggleParticleRun={handleToggleParticleRun}
+          onResetParticle={handleResetParticle}
+          onRemoveParticle={handleRemoveParticle}
+          onToggleParticleForce={() => setShowParticleForce((v) => !v)}
         />
       </main>
     </div>
   );
 }
+
 

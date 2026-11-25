@@ -16,6 +16,8 @@ export type SimulationModel = 'point' | 'uniform';
 export type FieldDisplayMode = 'none' | 'lines' | 'vectors' | 'both';
 export type ToolMode = 'select' | 'add-positive' | 'add-negative';
 export type VectorScaleMode = 'logarithmic' | 'uniform';
+export type InteractionMode = 'edit' | 'particle';
+export type ParticleRunState = 'idle' | 'running' | 'paused' | 'finished';
 
 export interface WorldBounds {
   minX: number;
@@ -1020,3 +1022,256 @@ export function formatScientificJP(value: number, unit: string): string {
   }
   return `${value.toFixed(1)} ${unit}`;
 }
+
+export interface TestParticleEvaluation {
+  ex: number;
+  ey: number;
+  magnitude: number;
+  potentialVolts: number;
+}
+
+export function evaluateTestParticleFieldAndPotential(
+  x: number,
+  y: number,
+  simulationModel: SimulationModel,
+  charges: PointCharge[],
+  columns: ChargeColumn[],
+  isCapacitorMode: boolean
+): TestParticleEvaluation {
+  if (simulationModel === 'uniform') {
+    const isCap =
+      isCapacitorMode &&
+      columns.length === 2 &&
+      columns[0].potentialVolts !== undefined &&
+      columns[1].potentialVolts !== undefined;
+
+    if (isCap) {
+      const [c0, c1] = columns;
+      const left = c0.x <= c1.x ? c0 : c1;
+      const right = c0.x <= c1.x ? c1 : c0;
+      const d = Math.max(0.5, right.x - left.x);
+      const vLeft = left.potentialVolts ?? 0;
+      const vRight = right.potentialVolts ?? 0;
+      const inside = x > left.x && x < right.x;
+      const ex = inside ? (vLeft - vRight) / d : 0;
+      const potentialVolts = evaluateCapacitorPotential(x, columns);
+      return {
+        ex,
+        ey: 0,
+        magnitude: Math.abs(ex),
+        potentialVolts,
+      };
+    }
+
+    const activeColumns = columns.filter((c) => Math.abs(c.q) >= 0.05);
+    if (activeColumns.length === 0) {
+      return { ex: 0, ey: 0, magnitude: 0, potentialVolts: 0 };
+    }
+    const { ex, ey, magnitude } = evaluateUniformField(x, activeColumns);
+    const potentialVolts = evaluateUniformPotential(x, activeColumns);
+    return { ex, ey, magnitude, potentialVolts };
+  }
+
+  const activeCharges = charges.filter((c) => Math.abs(c.q) >= 0.05);
+  if (activeCharges.length === 0) {
+    return { ex: 0, ey: 0, magnitude: 0, potentialVolts: 0 };
+  }
+  const { ex, ey, magnitude } = evaluateField(x, y, activeCharges);
+  const potentialVolts = evaluatePotential(x, y, activeCharges);
+  return { ex, ey, magnitude, potentialVolts };
+}
+
+export interface TestParticleStepResult {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  stopped: boolean;
+}
+
+const POINT_ACCEL_SCALE = 0.0022;
+const UNIFORM_ACCEL_SCALE = 0.08;
+
+function evaluateSoftenedPointAccel(
+  x: number,
+  y: number,
+  qSign: 1 | -1,
+  activeCharges: PointCharge[]
+): { ax: number; ay: number } {
+  let ex = 0;
+  let ey = 0;
+  for (let i = 0; i < activeCharges.length; i++) {
+    const c = activeCharges[i];
+    const dx = x - c.x;
+    const dy = y - c.y;
+    const r = Math.hypot(dx, dy);
+    if (r < 1e-6) continue;
+    const rEff = Math.max(0.32, r);
+    const factor = (K_MICRO * c.q) / (r * rEff * rEff);
+    ex += factor * dx;
+    ey += factor * dy;
+  }
+  return {
+    ax: qSign * ex * POINT_ACCEL_SCALE,
+    ay: qSign * ey * POINT_ACCEL_SCALE,
+  };
+}
+
+export function stepTestParticle(
+  x: number,
+  y: number,
+  vx: number,
+  vy: number,
+  qSign: 1 | -1,
+  dt: number,
+  simulationModel: SimulationModel,
+  charges: PointCharge[],
+  columns: ChargeColumn[],
+  isCapacitorMode: boolean,
+  domainHalf: number
+): TestParticleStepResult {
+  const clampedDt = Math.min(0.033, Math.max(0, dt));
+  if (clampedDt <= 0) {
+    return { x, y, vx, vy, stopped: false };
+  }
+
+  const SUBSTEPS = 4;
+  const subDt = clampedDt / SUBSTEPS;
+  const bound = domainHalf - 0.25;
+
+  let px = x;
+  let py = y;
+  let pvx = vx;
+  let pvy = vy;
+  let stopped = false;
+
+  if (simulationModel === 'uniform') {
+    const isCap =
+      isCapacitorMode &&
+      columns.length === 2 &&
+      columns[0].potentialVolts !== undefined &&
+      columns[1].potentialVolts !== undefined;
+    const activeColumns = isCap
+      ? resolveCapacitorColumns(columns)
+      : columns.filter((c) => Math.abs(c.q) >= 0.05);
+
+    const leftCap = isCap
+      ? columns[0].x <= columns[1].x
+        ? columns[0]
+        : columns[1]
+      : null;
+    const rightCap = isCap
+      ? columns[0].x <= columns[1].x
+        ? columns[1]
+        : columns[0]
+      : null;
+
+    const getAx = (ux: number): number => {
+      if (isCap && leftCap && rightCap) {
+        if (ux > leftCap.x && ux < rightCap.x) {
+          const d = Math.max(0.5, rightCap.x - leftCap.x);
+          const ex =
+            ((leftCap.potentialVolts ?? 0) - (rightCap.potentialVolts ?? 0)) /
+            d;
+          return qSign * ex * UNIFORM_ACCEL_SCALE;
+        }
+        return 0;
+      }
+      return qSign * evaluateUniformField(ux, activeColumns).ex * UNIFORM_ACCEL_SCALE;
+    };
+
+    const collisionCols = isCap ? columns : activeColumns;
+
+    for (let s = 0; s < SUBSTEPS; s++) {
+      const ax1 = getAx(px);
+      const nx = px + pvx * subDt + 0.5 * ax1 * subDt * subDt;
+      const ny = py + pvy * subDt;
+
+      let hitColumn = false;
+      for (let i = 0; i < collisionCols.length; i++) {
+        const col = collisionCols[i];
+        const dxBefore = px - col.x;
+        const dxAfter = nx - col.x;
+        const movingToward = dxBefore * (nx - px) < 0;
+        const crossed = dxBefore * dxAfter <= 0 && Math.abs(dxBefore) > 1e-4;
+        if ((movingToward && Math.abs(dxAfter) <= 0.20) || crossed) {
+          const side = dxBefore >= 0 ? 1 : -1;
+          px = col.x + side * 0.20;
+          py = ny;
+          pvx = 0;
+          pvy = 0;
+          stopped = true;
+          hitColumn = true;
+          break;
+        }
+      }
+      if (hitColumn) break;
+
+      if (Math.abs(nx) >= bound || Math.abs(ny) >= bound) {
+        px = Math.max(-bound, Math.min(bound, nx));
+        py = Math.max(-bound, Math.min(bound, ny));
+        pvx = 0;
+        pvy = 0;
+        stopped = true;
+        break;
+      }
+
+      const ax2 = getAx(nx);
+      pvx += 0.5 * (ax1 + ax2) * subDt;
+      pvy = 0;
+      px = nx;
+      py = ny;
+    }
+
+    return { x: px, y: py, vx: pvx, vy: pvy, stopped };
+  }
+
+  // Point-charge mode
+  const activeCharges = charges.filter((c) => Math.abs(c.q) >= 0.05);
+
+  for (let s = 0; s < SUBSTEPS; s++) {
+    const a1 = evaluateSoftenedPointAccel(px, py, qSign, activeCharges);
+    const nx = px + pvx * subDt + 0.5 * a1.ax * subDt * subDt;
+    const ny = py + pvy * subDt + 0.5 * a1.ay * subDt * subDt;
+
+    let captured = false;
+    for (let i = 0; i < activeCharges.length; i++) {
+      const c = activeCharges[i];
+      if (c.q * qSign >= 0) continue; // Only attractive charges capture
+      const distAfter = Math.hypot(nx - c.x, ny - c.y);
+      if (distAfter <= 0.28) {
+        const vxRel = px - c.x;
+        const vyRel = py - c.y;
+        const distBefore = Math.hypot(vxRel, vyRel);
+        const ux = distBefore > 1e-5 ? vxRel / distBefore : 1;
+        const uy = distBefore > 1e-5 ? vyRel / distBefore : 0;
+        px = c.x + ux * 0.28;
+        py = c.y + uy * 0.28;
+        pvx = 0;
+        pvy = 0;
+        stopped = true;
+        captured = true;
+        break;
+      }
+    }
+    if (captured) break;
+
+    if (Math.abs(nx) >= bound || Math.abs(ny) >= bound) {
+      px = Math.max(-bound, Math.min(bound, nx));
+      py = Math.max(-bound, Math.min(bound, ny));
+      pvx = 0;
+      pvy = 0;
+      stopped = true;
+      break;
+    }
+
+    const a2 = evaluateSoftenedPointAccel(nx, ny, qSign, activeCharges);
+    pvx += 0.5 * (a1.ax + a2.ax) * subDt;
+    pvy += 0.5 * (a1.ay + a2.ay) * subDt;
+    px = nx;
+    py = ny;
+  }
+
+  return { x: px, y: py, vx: pvx, vy: pvy, stopped };
+}
+

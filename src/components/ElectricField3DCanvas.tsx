@@ -7,6 +7,8 @@ import {
   ChargeColumn,
   SimulationModel,
   FieldDisplayMode,
+  InteractionMode,
+  ParticleRunState,
   WorldBounds,
   evaluateField,
   evaluatePotential,
@@ -14,6 +16,8 @@ import {
   evaluateUniformPotential,
   resolveCapacitorColumns,
   evaluateCapacitorPotential,
+  evaluateTestParticleFieldAndPotential,
+  stepTestParticle,
   potentialToHeight,
   V_AXIS_MAX_HEIGHT,
   traceFieldLines,
@@ -28,6 +32,7 @@ type CameraPreset = 'top' | 'iso' | 'side';
 interface ElectricField3DCanvasProps {
   simulationModel: SimulationModel;
   isCapacitorMode: boolean;
+  interactionMode: InteractionMode;
   charges: PointCharge[];
   selectedChargeId: string | null;
   columns: ChargeColumn[];
@@ -36,10 +41,17 @@ interface ElectricField3DCanvasProps {
   showEquipotentials: boolean;
   showPotentialTint: boolean;
   snapToInteger: boolean;
+  particleAnchor: { x: number; y: number } | null;
+  particleSign: 1 | -1;
+  particleRunState: ParticleRunState;
+  particleResetNonce: number;
+  showParticleForce: boolean;
   onSelectCharge: (id: string | null) => void;
   onMoveCharge: (id: string, x: number, y: number) => void;
   onSelectColumn: (id: string | null) => void;
   onMoveColumn: (id: string, x: number) => void;
+  onPlaceParticle: (x: number, y: number) => void;
+  onParticleFinished: () => void;
 }
 
 const DOMAIN_HALF = 16;
@@ -179,6 +191,7 @@ function getChargeColor(q: number): THREE.Color {
 export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
   simulationModel,
   isCapacitorMode,
+  interactionMode,
   charges,
   selectedChargeId,
   columns,
@@ -187,16 +200,24 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
   showEquipotentials,
   showPotentialTint,
   snapToInteger,
+  particleAnchor,
+  particleSign,
+  particleRunState,
+  particleResetNonce,
+  showParticleForce,
   onSelectCharge,
   onMoveCharge,
   onSelectColumn,
   onMoveColumn,
+  onPlaceParticle,
+  onParticleFinished,
 }) => {
   const mountRef = useRef<HTMLDivElement>(null);
 
   const propsRef = useRef({
     simulationModel,
     isCapacitorMode,
+    interactionMode,
     charges,
     selectedChargeId,
     columns,
@@ -205,14 +226,22 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     showEquipotentials,
     showPotentialTint,
     snapToInteger,
+    particleAnchor,
+    particleSign,
+    particleRunState,
+    particleResetNonce,
+    showParticleForce,
     onSelectCharge,
     onMoveCharge,
     onSelectColumn,
     onMoveColumn,
+    onPlaceParticle,
+    onParticleFinished,
   });
   propsRef.current = {
     simulationModel,
     isCapacitorMode,
+    interactionMode,
     charges,
     selectedChargeId,
     columns,
@@ -221,10 +250,17 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     showEquipotentials,
     showPotentialTint,
     snapToInteger,
+    particleAnchor,
+    particleSign,
+    particleRunState,
+    particleResetNonce,
+    showParticleForce,
     onSelectCharge,
     onMoveCharge,
     onSelectColumn,
     onMoveColumn,
+    onPlaceParticle,
+    onParticleFinished,
   };
 
   const [draggingId, setDraggingId] = useState<string | null>(null);
@@ -235,6 +271,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     requestRender: () => void;
     setCameraPreset: (preset: CameraPreset) => void;
     rebuildPhysics: () => void;
+    syncParticleState: () => void;
   } | null>(null);
 
   useEffect(() => {
@@ -566,6 +603,294 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     const chargesGroup = new THREE.Group();
     scene.add(chargesGroup);
     let hitMeshes: THREE.Mesh[] = [];
+
+    // 8b. Reusable Test Particle + Synchronized Potential-Surface Particle + Force Vector + Trails
+    const MAX_TRAIL_POINTS = 480;
+    const testParticleRoot = new THREE.Group();
+    testParticleRoot.visible = false;
+    scene.add(testParticleRoot);
+
+    const xyParticleGroup = new THREE.Group();
+    testParticleRoot.add(xyParticleGroup);
+
+    const xySphereGeo = new THREE.SphereGeometry(0.18, 22, 16);
+    const xySphereMat = new THREE.MeshStandardMaterial({
+      color: 0xef4444,
+      roughness: 0.22,
+      metalness: 0.12,
+    });
+    const xySphereMesh = new THREE.Mesh(xySphereGeo, xySphereMat);
+    xySphereMesh.position.y = 0.21;
+    xyParticleGroup.add(xySphereMesh);
+
+    const particleHaloInnerGeo = new THREE.TorusGeometry(0.24, 0.025, 10, 28);
+    particleHaloInnerGeo.rotateX(Math.PI / 2);
+    const particleHaloInnerMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.25,
+      metalness: 0.1,
+    });
+    const particleHaloInner = new THREE.Mesh(
+      particleHaloInnerGeo,
+      particleHaloInnerMat
+    );
+    particleHaloInner.position.y = 0.032;
+    xyParticleGroup.add(particleHaloInner);
+
+    const particleHaloOuterGeo = new THREE.TorusGeometry(0.27, 0.015, 8, 28);
+    particleHaloOuterGeo.rotateX(Math.PI / 2);
+    const particleHaloOuterMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      roughness: 0.35,
+      metalness: 0.3,
+    });
+    const particleHaloOuter = new THREE.Mesh(
+      particleHaloOuterGeo,
+      particleHaloOuterMat
+    );
+    particleHaloOuter.position.y = 0.032;
+    xyParticleGroup.add(particleHaloOuter);
+
+    const particleHitGeo = new THREE.SphereGeometry(0.65, 12, 10);
+    const particleHitMat = new THREE.MeshBasicMaterial({ visible: false });
+    const particleHitMesh = new THREE.Mesh(particleHitGeo, particleHitMat);
+    particleHitMesh.position.y = 0.21;
+    particleHitMesh.layers.set(1);
+    particleHitMesh.userData.testParticle = true;
+    xyParticleGroup.add(particleHitMesh);
+
+    const surfaceSphereGeo = new THREE.SphereGeometry(0.16, 20, 14);
+    const surfaceSphereMat = new THREE.MeshStandardMaterial({
+      color: 0xef4444,
+      roughness: 0.22,
+      metalness: 0.12,
+      transparent: true,
+      opacity: 0,
+    });
+    const surfaceParticleMesh = new THREE.Mesh(
+      surfaceSphereGeo,
+      surfaceSphereMat
+    );
+    surfaceParticleMesh.visible = false;
+    testParticleRoot.add(surfaceParticleMesh);
+
+    const connectorPositions = new Float32Array(6);
+    const connectorGeo = new THREE.BufferGeometry();
+    connectorGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(connectorPositions, 3)
+    );
+    const connectorMat = new THREE.LineDashedMaterial({
+      color: 0x475569,
+      dashSize: 0.22,
+      gapSize: 0.14,
+      transparent: true,
+      opacity: 0,
+    });
+    const particleConnectorLine = new THREE.Line(connectorGeo, connectorMat);
+    particleConnectorLine.visible = false;
+    particleConnectorLine.frustumCulled = false;
+    testParticleRoot.add(particleConnectorLine);
+
+    const forceArrowGroup = new THREE.Group();
+    forceArrowGroup.visible = false;
+    testParticleRoot.add(forceArrowGroup);
+
+    const forceArrowMat = new THREE.MeshStandardMaterial({
+      color: 0x059669,
+      roughness: 0.3,
+      metalness: 0.08,
+    });
+    const forceShaftGeo = new THREE.CylinderGeometry(0.032, 0.032, 1, 10);
+    forceShaftGeo.translate(0, 0.5, 0);
+    const forceShaftMesh = new THREE.Mesh(forceShaftGeo, forceArrowMat);
+    forceArrowGroup.add(forceShaftMesh);
+
+    const forceHeadGeo = new THREE.ConeGeometry(0.09, 0.22, 12);
+    forceHeadGeo.translate(0, 0.11, 0);
+    const forceHeadMesh = new THREE.Mesh(forceHeadGeo, forceArrowMat);
+    forceArrowGroup.add(forceHeadMesh);
+
+    const forceLabelSprite = createTextSprite('F', '#047857', 34);
+    forceLabelSprite.visible = false;
+    testParticleRoot.add(forceLabelSprite);
+
+    const xyTrailPositions = new Float32Array(MAX_TRAIL_POINTS * 3);
+    const xyTrailGeo = new THREE.BufferGeometry();
+    xyTrailGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(xyTrailPositions, 3)
+    );
+    xyTrailGeo.setDrawRange(0, 0);
+    const xyTrailMat = new THREE.LineBasicMaterial({
+      color: 0xdc2626,
+      transparent: true,
+      opacity: 0.68,
+    });
+    const xyTrailLine = new THREE.Line(xyTrailGeo, xyTrailMat);
+    xyTrailLine.frustumCulled = false;
+    xyTrailLine.visible = false;
+    testParticleRoot.add(xyTrailLine);
+
+    const surfaceTrailPositions = new Float32Array(MAX_TRAIL_POINTS * 3);
+    const surfaceTrailGeo = new THREE.BufferGeometry();
+    surfaceTrailGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(surfaceTrailPositions, 3)
+    );
+    surfaceTrailGeo.setDrawRange(0, 0);
+    const surfaceTrailMat = new THREE.LineBasicMaterial({
+      color: 0xdc2626,
+      transparent: true,
+      opacity: 0,
+    });
+    const surfaceTrailLine = new THREE.Line(surfaceTrailGeo, surfaceTrailMat);
+    surfaceTrailLine.frustumCulled = false;
+    surfaceTrailLine.visible = false;
+    testParticleRoot.add(surfaceTrailLine);
+
+    const liveParticle = {
+      active: false,
+      x: 0,
+      y: 0,
+      vx: 0,
+      vy: 0,
+      stopped: false,
+      trailCount: 0,
+      lastTrailX: 0,
+      lastTrailY: 0,
+      lastAnchorX: NaN,
+      lastAnchorY: NaN,
+      lastResetNonce: -1,
+    };
+
+    const appendTrailPoint = (px: number, py: number) => {
+      if (liveParticle.trailCount >= MAX_TRAIL_POINTS) return;
+      const { simulationModel: m, charges: ch, columns: cols, isCapacitorMode: isCap } =
+        propsRef.current;
+      const evalRes = evaluateTestParticleFieldAndPotential(
+        px,
+        py,
+        m,
+        ch,
+        cols,
+        isCap
+      );
+      const surfH = potentialToHeight(evalRes.potentialVolts, m === 'uniform') + 0.04;
+      const idx = liveParticle.trailCount * 3;
+      xyTrailPositions[idx] = px;
+      xyTrailPositions[idx + 1] = 0.065;
+      xyTrailPositions[idx + 2] = -py;
+      surfaceTrailPositions[idx] = px;
+      surfaceTrailPositions[idx + 1] = surfH;
+      surfaceTrailPositions[idx + 2] = -py;
+      liveParticle.trailCount++;
+      liveParticle.lastTrailX = px;
+      liveParticle.lastTrailY = py;
+      (xyTrailGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+      (surfaceTrailGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    };
+
+    const getTiltFactor = () => {
+      const polarAngle = controls.getPolarAngle();
+      const rawTilt = THREE.MathUtils.clamp((polarAngle - 0.06) / 0.45, 0, 1);
+      return rawTilt * rawTilt * (3 - 2 * rawTilt);
+    };
+
+    const syncTestParticleVisuals = (tiltFactor: number) => {
+      const {
+        interactionMode: curMode,
+        particleSign: qSign,
+        showParticleForce: showForce,
+        simulationModel: curModel,
+        charges: curCharges,
+        columns: curCols,
+        isCapacitorMode: curCap,
+      } = propsRef.current;
+
+      if (curMode !== 'particle' || !liveParticle.active) {
+        testParticleRoot.visible = false;
+        return;
+      }
+
+      testParticleRoot.visible = true;
+      const isUniform = curModel === 'uniform';
+      const pColor = qSign > 0 ? 0xef4444 : 0x3b82f6;
+      const trailColor = qSign > 0 ? 0xdc2626 : 0x2563eb;
+      xySphereMat.color.setHex(pColor);
+      surfaceSphereMat.color.setHex(pColor);
+      xyTrailMat.color.setHex(trailColor);
+      surfaceTrailMat.color.setHex(trailColor);
+
+      const evalRes = evaluateTestParticleFieldAndPotential(
+        liveParticle.x,
+        liveParticle.y,
+        curModel,
+        curCharges,
+        curCols,
+        curCap
+      );
+      const surfY = potentialToHeight(evalRes.potentialVolts, isUniform) + 0.17;
+      const show3D = tiltFactor > 0.005;
+
+      xyParticleGroup.position.set(liveParticle.x, 0, -liveParticle.y);
+
+      surfaceParticleMesh.position.set(liveParticle.x, surfY, -liveParticle.y);
+      surfaceParticleMesh.visible = show3D;
+      surfaceSphereMat.opacity = 0.96 * tiltFactor;
+
+      connectorPositions[0] = liveParticle.x;
+      connectorPositions[1] = 0.21;
+      connectorPositions[2] = -liveParticle.y;
+      connectorPositions[3] = liveParticle.x;
+      connectorPositions[4] = surfY;
+      connectorPositions[5] = -liveParticle.y;
+      (connectorGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+      particleConnectorLine.computeLineDistances();
+      particleConnectorLine.visible = show3D;
+      connectorMat.opacity = 0.55 * tiltFactor;
+
+      xyTrailGeo.setDrawRange(0, liveParticle.trailCount);
+      xyTrailLine.visible = liveParticle.trailCount >= 2;
+
+      surfaceTrailGeo.setDrawRange(0, liveParticle.trailCount);
+      surfaceTrailLine.visible = show3D && liveParticle.trailCount >= 2;
+      surfaceTrailMat.opacity = 0.72 * tiltFactor;
+
+      const fx = qSign * evalRes.ex;
+      const fy = qSign * evalRes.ey;
+      const fMag = Math.hypot(fx, fy);
+      if (showForce && fMag >= 1e-2) {
+        const strengthNorm = isUniform
+          ? Math.log10(1 + fMag / 10) / Math.log10(1 + 400 / 10)
+          : Math.log10(1 + fMag / 350) / Math.log10(1 + 95000 / 350);
+        const clampedNorm = Math.max(0, Math.min(1, strengthNorm));
+        const totalLen = 0.55 + clampedNorm * 1.55;
+        const shaftLen = Math.max(0.22, totalLen - 0.22);
+
+        _dirVec.set(fx, 0, -fy).normalize();
+        _quat.setFromUnitVectors(_upVec, _dirVec);
+        forceArrowGroup.visible = true;
+        forceArrowGroup.position.set(
+          liveParticle.x + _dirVec.x * 0.2,
+          0.21,
+          -liveParticle.y + _dirVec.z * 0.2
+        );
+        forceArrowGroup.quaternion.copy(_quat);
+        forceShaftMesh.scale.set(1, shaftLen, 1);
+        forceHeadMesh.position.set(0, shaftLen, 0);
+
+        forceLabelSprite.visible = true;
+        forceLabelSprite.position.set(
+          liveParticle.x + _dirVec.x * (0.2 + shaftLen + 0.42),
+          0.34,
+          -liveParticle.y + _dirVec.z * (0.2 + shaftLen + 0.42)
+        );
+      } else {
+        forceArrowGroup.visible = false;
+        forceLabelSprite.visible = false;
+      }
+    };
 
     const rebuildPhysics = () => {
       const {
@@ -1161,6 +1486,52 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
         const rawTilt = THREE.MathUtils.clamp((polarAngle - 0.06) / 0.45, 0, 1);
         const tiltFactor = rawTilt * rawTilt * (3 - 2 * rawTilt);
 
+        // Advance test particle physics when running
+        const curProps = propsRef.current;
+        if (
+          curProps.interactionMode === 'particle' &&
+          curProps.particleRunState === 'running' &&
+          liveParticle.active &&
+          !liveParticle.stopped
+        ) {
+          const stepRes = stepTestParticle(
+            liveParticle.x,
+            liveParticle.y,
+            liveParticle.vx,
+            liveParticle.vy,
+            curProps.particleSign,
+            Math.min(0.033, delta),
+            curProps.simulationModel,
+            curProps.charges,
+            curProps.columns,
+            curProps.isCapacitorMode,
+            DOMAIN_HALF
+          );
+          liveParticle.x = stepRes.x;
+          liveParticle.y = stepRes.y;
+          liveParticle.vx = stepRes.vx;
+          liveParticle.vy = stepRes.vy;
+
+          if (
+            Math.hypot(
+              liveParticle.x - liveParticle.lastTrailX,
+              liveParticle.y - liveParticle.lastTrailY
+            ) >= 0.08
+          ) {
+            appendTrailPoint(liveParticle.x, liveParticle.y);
+          }
+
+          if (stepRes.stopped) {
+            liveParticle.stopped = true;
+            appendTrailPoint(liveParticle.x, liveParticle.y);
+            curProps.onParticleFinished();
+          } else {
+            needsMoreFrames = true;
+          }
+        }
+
+        syncTestParticleVisuals(tiltFactor);
+
         const targetSurfaceOpacity = propsRef.current.showPotentialTint ? 0.86 : 0.58;
         const targetWireOpacity = propsRef.current.showPotentialTint ? 0.11 : 0.20;
 
@@ -1225,17 +1596,61 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
       requestRender();
     };
 
+    const syncParticleState = () => {
+      const {
+        interactionMode: curMode,
+        particleAnchor: curAnchor,
+        particleResetNonce: curNonce,
+        particleRunState: curRunState,
+      } = propsRef.current;
+
+      if (curMode !== 'particle' || !curAnchor) {
+        liveParticle.active = false;
+        liveParticle.trailCount = 0;
+        liveParticle.lastAnchorX = NaN;
+        liveParticle.lastAnchorY = NaN;
+        liveParticle.lastResetNonce = curNonce;
+      } else {
+        const anchorChanged =
+          curAnchor.x !== liveParticle.lastAnchorX ||
+          curAnchor.y !== liveParticle.lastAnchorY ||
+          curNonce !== liveParticle.lastResetNonce;
+        if (!liveParticle.active || anchorChanged) {
+          liveParticle.active = true;
+          liveParticle.x = curAnchor.x;
+          liveParticle.y = curAnchor.y;
+          liveParticle.vx = 0;
+          liveParticle.vy = 0;
+          liveParticle.stopped = false;
+          liveParticle.trailCount = 0;
+          liveParticle.lastAnchorX = curAnchor.x;
+          liveParticle.lastAnchorY = curAnchor.y;
+          liveParticle.lastResetNonce = curNonce;
+          appendTrailPoint(curAnchor.x, curAnchor.y);
+        } else if (curRunState !== 'finished') {
+          liveParticle.stopped = false;
+        }
+      }
+
+      if (curRunState === 'running') {
+        lastTime = performance.now();
+      }
+      syncTestParticleVisuals(getTiltFactor());
+    };
+
     sceneRefs.current = {
       requestRender,
       setCameraPreset,
       rebuildPhysics,
+      syncParticleState,
     };
 
     rebuildPhysics();
+    syncParticleState();
     requestRender();
 
     // 10. Pointer & Touch Handling
-    let activeDragTarget: { type: 'charge' | 'column'; id: string } | null = null;
+    let activeDragTarget: { type: 'charge' | 'column' | 'particle'; id: string } | null = null;
     let pointerDownPos: { x: number; y: number; time: number } | null = null;
 
     const updateNdc = (e: PointerEvent) => {
@@ -1255,6 +1670,33 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
       updateNdc(e);
       _raycaster.setFromCamera(_ndc, camera);
       _raycaster.layers.set(1);
+
+      if (propsRef.current.interactionMode === 'particle') {
+        const hits = liveParticle.active
+          ? _raycaster.intersectObject(particleHitMesh, false)
+          : [];
+        if (hits.length > 0) {
+          activeDragTarget = { type: 'particle', id: 'test-particle' };
+          setDraggingId('test-particle');
+          controls.enabled = false;
+          camTargetPos = null;
+          camLookTarget = null;
+          try {
+            renderer.domElement.setPointerCapture(e.pointerId);
+          } catch {
+            // Ignore
+          }
+          e.stopPropagation();
+        } else {
+          pointerDownPos = {
+            x: e.clientX,
+            y: e.clientY,
+            time: performance.now(),
+          };
+        }
+        return;
+      }
+
       const hits = _raycaster.intersectObjects(hitMeshes, false);
 
       if (hits.length > 0) {
@@ -1313,7 +1755,11 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
             const finalY = snap
               ? Math.round(clampedY)
               : Math.round(clampedY * 10) / 10;
-            propsRef.current.onMoveCharge(activeDragTarget.id, finalX, finalY);
+            if (activeDragTarget.type === 'particle') {
+              propsRef.current.onPlaceParticle(finalX, finalY);
+            } else {
+              propsRef.current.onMoveCharge(activeDragTarget.id, finalX, finalY);
+            }
           }
         }
         return;
@@ -1321,8 +1767,15 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
 
       if (e.pointerType === 'mouse') {
         _raycaster.layers.set(1);
-        const hits = _raycaster.intersectObjects(hitMeshes, false);
-        setHoveringCharge(hits.length > 0);
+        if (propsRef.current.interactionMode === 'particle') {
+          const hits = liveParticle.active
+            ? _raycaster.intersectObject(particleHitMesh, false)
+            : [];
+          setHoveringCharge(hits.length > 0);
+        } else {
+          const hits = _raycaster.intersectObjects(hitMeshes, false);
+          setHoveringCharge(hits.length > 0);
+        }
       }
     };
 
@@ -1346,7 +1799,32 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
         );
         const elapsed = performance.now() - pointerDownPos.time;
         if (dist < 6 && elapsed < 260) {
-          if (propsRef.current.simulationModel === 'uniform') {
+          if (propsRef.current.interactionMode === 'particle') {
+            updateNdc(e);
+            _raycaster.setFromCamera(_ndc, camera);
+            if (
+              _raycaster.ray.intersectPlane(_dragPlane, _planeHit) &&
+              Math.abs(_planeHit.x) <= DOMAIN_HALF + 1 &&
+              Math.abs(_planeHit.z) <= DOMAIN_HALF + 1
+            ) {
+              const clampedX = Math.max(
+                -DOMAIN_HALF + 0.5,
+                Math.min(DOMAIN_HALF - 0.5, _planeHit.x)
+              );
+              const clampedY = Math.max(
+                -DOMAIN_HALF + 0.5,
+                Math.min(DOMAIN_HALF - 0.5, -_planeHit.z)
+              );
+              const snap = propsRef.current.snapToInteger;
+              const finalX = snap
+                ? Math.round(clampedX)
+                : Math.round(clampedX * 10) / 10;
+              const finalY = snap
+                ? Math.round(clampedY)
+                : Math.round(clampedY * 10) / 10;
+              propsRef.current.onPlaceParticle(finalX, finalY);
+            }
+          } else if (propsRef.current.simulationModel === 'uniform') {
             propsRef.current.onSelectColumn(null);
           } else {
             propsRef.current.onSelectCharge(null);
@@ -1395,6 +1873,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
       disposeObject3D(equipotentialGroup);
       disposeObject3D(fieldLinesGroup);
       disposeObject3D(chargesGroup);
+      disposeObject3D(testParticleRoot);
       surfaceGeo.dispose();
       surfaceMat.dispose();
       surfaceWireMat.dispose();
@@ -1429,6 +1908,22 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     showPotentialTint,
   ]);
 
+  useEffect(() => {
+    sceneRefs.current?.syncParticleState();
+    sceneRefs.current?.requestRender();
+  }, [
+    interactionMode,
+    particleAnchor,
+    particleSign,
+    particleRunState,
+    particleResetNonce,
+    showParticleForce,
+    simulationModel,
+    isCapacitorMode,
+    charges,
+    columns,
+  ]);
+
   const handleCameraPreset = useCallback((preset: CameraPreset) => {
     setActiveCamPreset(preset);
     sceneRefs.current?.setCameraPreset(preset);
@@ -1438,7 +1933,9 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     ? 'cursor-grabbing'
     : hoveringCharge
       ? 'cursor-grab'
-      : 'cursor-move';
+      : interactionMode === 'particle'
+        ? 'cursor-crosshair'
+        : 'cursor-move';
 
   return (
     <div className="relative w-full h-full min-h-[380px] bg-slate-50 overflow-hidden select-none">
