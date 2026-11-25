@@ -5,6 +5,7 @@ import {
   ChargeColumn,
   SimulationModel,
   FieldDisplayMode,
+  resolveCapacitorColumns,
 } from '../physics/electrostatics';
 
 interface ControlDeckProps {
@@ -29,6 +30,8 @@ interface ControlDeckProps {
   onClearAllCharges: () => void;
   onQuickAddColumn: (q: number) => void;
   onUpdateColumnQ: (id: string, q: number) => void;
+  onUpdateColumnPotential: (id: string, potentialVolts: number) => void;
+  onSwapCapacitorPotentials: () => void;
   onDeleteColumn: (id: string) => void;
   onClearAllColumns: () => void;
 }
@@ -84,12 +87,23 @@ export const ControlDeck: React.FC<ControlDeckProps> = ({
   onClearAllCharges,
   onQuickAddColumn,
   onUpdateColumnQ,
+  onUpdateColumnPotential,
+  onSwapCapacitorPotentials,
   onDeleteColumn,
   onClearAllColumns,
 }) => {
   const [showGuide, setShowGuide] = useState(false);
 
   const isUniform = simulationModel === 'uniform';
+  const isCapPotentialMode =
+    isUniform &&
+    isCapacitorMode &&
+    columns.length === 2 &&
+    columns[0].potentialVolts !== undefined &&
+    columns[1].potentialVolts !== undefined;
+  const resolvedCapColumns = isCapPotentialMode
+    ? resolveCapacitorColumns(columns)
+    : columns;
   const selectedCharge =
     charges.find((c) => c.id === selectedChargeId) ?? null;
   const selectedColumn =
@@ -289,18 +303,129 @@ export const ControlDeck: React.FC<ControlDeckProps> = ({
         </section>
       )}
 
-      {/* Chunk 3: Selected Charge or Column Inspector */}
-      {isUniform ? (
+      {/* Chunk 3: Selected Charge, Capacitor Potentials, or Column Inspector */}
+      {isCapPotentialMode ? (
+        <section className="p-5 border-b border-slate-100 space-y-4 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-xs font-semibold text-slate-500">
+              極板の電位設定
+            </h2>
+            <span className="text-[11px] font-medium text-slate-400">
+              ドラッグで極板間隔を変更
+            </span>
+          </div>
+
+          <div className="space-y-4">
+            {resolvedCapColumns.map((col, idx) => {
+              const volts = Math.round(col.potentialVolts ?? 0);
+              const isPosPlate = col.q > 0.01;
+              const isNegPlate = col.q < -0.01;
+              const plateTitle = isPosPlate
+                ? '正電荷の列の電位'
+                : isNegPlate
+                  ? '負電荷の列の電位'
+                  : `列${idx + 1}の電位`;
+              return (
+                <div key={col.id} className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className={`inline-flex items-center justify-center w-5 h-5 shrink-0 rounded-full text-white text-xs font-bold ${
+                          isPosPlate
+                            ? 'bg-red-600'
+                            : isNegPlate
+                              ? 'bg-blue-600'
+                              : 'bg-slate-500'
+                        }`}
+                      >
+                        {isPosPlate ? '+' : isNegPlate ? '−' : '0'}
+                      </span>
+                      <label
+                        htmlFor={`cap-v-slider-${col.id}`}
+                        className="text-xs font-medium text-slate-700 truncate"
+                      >
+                        {plateTitle}
+                      </label>
+                      <span className="font-mono-tabular text-[11px] text-slate-400 shrink-0">
+                        (x={col.x.toFixed(1)}m)
+                      </span>
+                    </div>
+                    <span
+                      className={`font-mono-tabular text-sm font-semibold shrink-0 ${
+                        volts > 0
+                          ? 'text-orange-700'
+                          : volts < 0
+                            ? 'text-cyan-700'
+                            : 'text-slate-700'
+                      }`}
+                    >
+                      {volts > 0 ? '+' : volts < 0 ? '−' : ''}
+                      {Math.abs(volts)} V
+                    </span>
+                  </div>
+
+                  <input
+                    id={`cap-v-slider-${col.id}`}
+                    type="range"
+                    min={-200}
+                    max={200}
+                    step={10}
+                    value={volts}
+                    onChange={(e) =>
+                      onUpdateColumnPotential(
+                        col.id,
+                        parseFloat(e.target.value)
+                      )
+                    }
+                    style={{
+                      background:
+                        'linear-gradient(to right, #0891B2 0%, #94A3B8 50%, #EA580C 100%)',
+                    }}
+                    className="physics-slider w-full cursor-pointer"
+                  />
+
+                  <div className="flex justify-between text-[11px] font-mono-tabular text-slate-400">
+                    <span>−200 V</span>
+                    <span>0</span>
+                    <span>+200 V</span>
+                  </div>
+                </div>
+              );
+            })}
+
+            {(() => {
+              const v0 = resolvedCapColumns[0].potentialVolts ?? 0;
+              const v1 = resolvedCapColumns[1].potentialVolts ?? 0;
+              const d = Math.max(
+                0.5,
+                Math.abs(resolvedCapColumns[1].x - resolvedCapColumns[0].x)
+              );
+              const deltaV = Math.abs(v0 - v1);
+              const eField = Math.abs(v0 - v1) / d;
+              return (
+                <div className="font-mono-tabular text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-center">
+                  ΔV = {deltaV.toFixed(0)} V · d = {d.toFixed(1)} m · E ={' '}
+                  {eField.toFixed(0)} V/m
+                </div>
+              );
+            })()}
+
+            <button
+              type="button"
+              onClick={onSwapCapacitorPotentials}
+              className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2.5 min-h-[44px] text-xs font-medium text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors cursor-pointer"
+            >
+              <ArrowLeftRight className="w-3.5 h-3.5" />
+              正・負の電位を入れ替え (±)
+            </button>
+          </div>
+        </section>
+      ) : isUniform ? (
         <section className="p-5 border-b border-slate-100 space-y-4 flex-1">
           <div className="flex items-center justify-between gap-2">
             <h2 className="text-xs font-semibold text-slate-500">
               選択中の電荷の列
             </h2>
-            {isCapacitorMode && (
-              <span className="text-[11px] font-medium text-slate-500">
-                正・負が等量で連動
-              </span>
-            )}
           </div>
 
           {selectedColumn ? (
@@ -534,7 +659,17 @@ export const ControlDeck: React.FC<ControlDeckProps> = ({
 
         {showGuide && (
           <div className="mt-2 pb-2 space-y-2 text-xs text-slate-600 leading-relaxed">
-            {isUniform ? (
+            {isCapPotentialMode ? (
+              <>
+                <div className="font-mono-tabular text-slate-800 bg-slate-50 border border-slate-200 rounded-md px-3 py-2 space-y-1">
+                  <div>E = ΔV / d [V/m]</div>
+                  <div>Q = C ΔV (間隔 d が狭いほど蓄えられる電気量が増加)</div>
+                </div>
+                <p>
+                  電位差 ΔV を保ったまま極板を近づけると、3D視点の電位の傾きが急になり電場 E が強くなります。外側では電場が打ち消し合い 0 になります。
+                </p>
+              </>
+            ) : isUniform ? (
               <>
                 <div className="font-mono-tabular text-slate-800 bg-slate-50 border border-slate-200 rounded-md px-3 py-2 space-y-1">
                   <div>E = 一定 [N/C] (列の両側で一様)</div>

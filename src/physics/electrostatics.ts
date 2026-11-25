@@ -9,6 +9,7 @@ export interface ChargeColumn {
   id: string;
   x: number; // meters (infinite column along y-axis at this x)
   q: number; // charge density parameter (-5.0 to +5.0)
+  potentialVolts?: number; // fixed electric potential in Volts (capacitor mode)
 }
 
 export type SimulationModel = 'point' | 'uniform';
@@ -101,7 +102,7 @@ export interface UniformPresetScenario {
   id: string;
   name: string;
   subtitle: string;
-  columns: Array<{ x: number; q: number }>;
+  columns: Array<{ x: number; q: number; potentialVolts?: number }>;
 }
 
 export const UNIFORM_PRESET_SCENARIOS: UniformPresetScenario[] = [
@@ -114,10 +115,10 @@ export const UNIFORM_PRESET_SCENARIOS: UniformPresetScenario[] = [
   {
     id: 'capacitor',
     name: 'コンデンサー',
-    subtitle: '+2.0 と −2.0',
+    subtitle: '+100 V と −100 V',
     columns: [
-      { x: -2, q: 2 },
-      { x: 2, q: -2 },
+      { x: -2, q: 2, potentialVolts: 100 },
+      { x: 2, q: -2, potentialVolts: -100 },
     ],
   },
   {
@@ -138,16 +139,20 @@ export const UNIFORM_PRESET_SCENARIOS: UniformPresetScenario[] = [
 ];
 
 // Uniform electric field strength per unit charge density on each side of a single column:
-// 2500 N/C per unit -> for capacitor (+2, -2) at x=±2, E_inside = 10,000 N/C, V(±2) = ∓20 kV.
-export const PLATE_E_PER_UNIT = 2500;
+// 12.5 V/m per unit -> single +2.0 has E = 25 V/m (V = ∓200 V at x = ±8 m);
+// capacitor (+100 V, -100 V) at x = ±2 m (d = 4 m) has E = 50 V/m and q = ±2.0.
+export const PLATE_E_PER_UNIT = 12.5;
 
-// Maps electric potential V [Volts] linearly to vertical 3D V-axis height
-// so 1/r divergence rises/falls steeply as a true asymptote up to ±9.0 units (±63 kV).
+// Maps electric potential V [Volts] linearly to vertical 3D V-axis height:
+// Point-charge mode: 7000 V/unit up to ±9.0 units (±63 kV).
+// Uniform-field mode: 25 V/unit so ±200 V maps cleanly to ±8.0 units (max ±225 V).
 export const V_AXIS_VOLTS_PER_UNIT = 7000;
+export const UNIFORM_V_AXIS_VOLTS_PER_UNIT = 25;
 export const V_AXIS_MAX_HEIGHT = 9.0;
 
-export function potentialToHeight(volts: number): number {
-  const h = volts / V_AXIS_VOLTS_PER_UNIT;
+export function potentialToHeight(volts: number, isUniform = false): number {
+  const scale = isUniform ? UNIFORM_V_AXIS_VOLTS_PER_UNIT : V_AXIS_VOLTS_PER_UNIT;
+  const h = volts / scale;
   return Math.max(-V_AXIS_MAX_HEIGHT, Math.min(V_AXIS_MAX_HEIGHT, h));
 }
 
@@ -182,6 +187,45 @@ export function evaluateUniformPotential(
     v += -PLATE_E_PER_UNIT * col.q * (Math.abs(x - col.x) - Math.abs(col.x));
   }
   return v;
+}
+
+export function resolveCapacitorColumns(
+  columns: ChargeColumn[]
+): ChargeColumn[] {
+  if (columns.length !== 2) return columns;
+  const [c0, c1] = columns;
+  if (c0.potentialVolts === undefined || c1.potentialVolts === undefined) {
+    return columns;
+  }
+  const left = c0.x <= c1.x ? c0 : c1;
+  const right = c0.x <= c1.x ? c1 : c0;
+  const d = Math.max(0.5, right.x - left.x);
+  const vLeft = left.potentialVolts!;
+  const vRight = right.potentialVolts!;
+  const qLeft = (vLeft - vRight) / (2 * PLATE_E_PER_UNIT * d);
+  const qRight = -qLeft;
+
+  return columns.map((col) => ({
+    ...col,
+    q: col.id === left.id ? qLeft : qRight,
+  }));
+}
+
+export function evaluateCapacitorPotential(
+  x: number,
+  columns: ChargeColumn[]
+): number {
+  if (columns.length !== 2) return 0;
+  const [c0, c1] = columns;
+  const left = c0.x <= c1.x ? c0 : c1;
+  const right = c0.x <= c1.x ? c1 : c0;
+  const vLeft = left.potentialVolts ?? 0;
+  const vRight = right.potentialVolts ?? 0;
+  if (x <= left.x) return vLeft;
+  if (x >= right.x) return vRight;
+  const d = right.x - left.x;
+  if (d < 1e-6) return 0.5 * (vLeft + vRight);
+  return vLeft + ((vRight - vLeft) / d) * (x - left.x);
 }
 
 export function evaluateField(
@@ -549,10 +593,13 @@ const EQUIPOTENTIAL_LEVELS_KV = [
 ];
 
 function formatVoltageLabel(volts: number): string {
-  if (Math.abs(volts) < 1) return '0 V';
-  const kv = volts / 1000;
-  const sign = kv > 0 ? '+' : '−';
-  const absKv = Math.abs(kv);
+  if (Math.abs(volts) < 0.5) return '0 V';
+  const sign = volts > 0 ? '+' : '−';
+  const absV = Math.abs(volts);
+  if (absV < 1000) {
+    return `${sign}${Math.round(absV)} V`;
+  }
+  const absKv = absV / 1000;
   const formatted = Number.isInteger(absKv) ? absKv.toFixed(0) : absKv.toFixed(2).replace(/0$/, '');
   return `${sign}${formatted} kV`;
 }
@@ -803,7 +850,7 @@ export function traceUniformFieldLines(
     const effUnits = sample.magnitude / PLATE_E_PER_UNIT;
     if (effUnits < 0.05) continue; // Outside capacitor where fields cancel to 0!
 
-    const dy = Math.max(0.45, Math.min(2.5, baseSpacingPerUnit / effUnits));
+    const dy = Math.max(0.25, Math.min(2.5, baseSpacingPerUnit / effUnits));
     const dirSign = sample.ex >= 0 ? 1 : -1;
     const angle = dirSign > 0 ? 0 : Math.PI;
 
@@ -878,14 +925,13 @@ export function computeUniformEquipotentialContours(
     const va = evaluateUniformPotential(a, active);
     const vb = evaluateUniformPotential(b, active);
     const dv = vb - va;
-    if (Math.abs(dv) < 1) continue; // Flat plateau (E=0)
+    if (Math.abs(dv) < 0.5) continue; // Flat plateau (E=0)
 
     const minV = Math.min(va, vb);
     const maxV = Math.max(va, vb);
 
-    for (const levelKv of EQUIPOTENTIAL_LEVELS_KV) {
-      const level = levelKv * 1000;
-      if (level < minV - 1e-3 || level > maxV + 1e-3) continue;
+    for (const level of UNIFORM_CONTOUR_LEVELS_V) {
+      if (level < minV - 0.1 || level > maxV + 0.1) continue;
       const t = (level - va) / dv;
       if (t < 0 || t > 1) continue;
       const xStar = a + t * (b - a);
@@ -913,6 +959,51 @@ export function computeUniformEquipotentialContours(
       label: formatVoltageLabel(level),
       segments: new Float32Array(arr),
       segmentCount: arr.length / 4,
+      labelPos: null,
+    });
+  }
+  return results;
+}
+
+const UNIFORM_CONTOUR_LEVELS_V = [
+  -360, -320, -280, -240,
+  -200, -180, -160, -140, -120, -100, -80, -60, -40, -20,
+  0,
+  20, 40, 60, 80, 100, 120, 140, 160, 180, 200,
+  240, 280, 320, 360,
+];
+
+export function computeCapacitorEquipotentialContours(
+  columns: ChargeColumn[],
+  bounds: WorldBounds
+): ContourLevelData[] {
+  if (columns.length !== 2) return [];
+  const [c0, c1] = columns;
+  const left = c0.x <= c1.x ? c0 : c1;
+  const right = c0.x <= c1.x ? c1 : c0;
+  const a = Math.max(bounds.minX, left.x);
+  const b = Math.min(bounds.maxX, right.x);
+  if (b - a < 1e-4) return [];
+
+  const va = left.potentialVolts ?? 0;
+  const vb = right.potentialVolts ?? 0;
+  const dv = vb - va;
+  if (Math.abs(dv) < 0.5) return [];
+
+  const minV = Math.min(va, vb);
+  const maxV = Math.max(va, vb);
+  const results: ContourLevelData[] = [];
+
+  for (const level of UNIFORM_CONTOUR_LEVELS_V) {
+    if (level <= minV + 0.5 || level >= maxV - 0.5) continue;
+    const t = (level - va) / dv;
+    if (t <= 0.005 || t >= 0.995) continue;
+    const xStar = a + t * (b - a);
+    results.push({
+      levelVolts: level,
+      label: formatVoltageLabel(level),
+      segments: new Float32Array([xStar, bounds.minY, xStar, bounds.maxY]),
+      segmentCount: 1,
       labelPos: null,
     });
   }

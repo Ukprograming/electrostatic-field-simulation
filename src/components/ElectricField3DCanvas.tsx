@@ -12,18 +12,22 @@ import {
   evaluatePotential,
   evaluateUniformField,
   evaluateUniformPotential,
+  resolveCapacitorColumns,
+  evaluateCapacitorPotential,
   potentialToHeight,
   V_AXIS_MAX_HEIGHT,
   traceFieldLines,
   traceUniformFieldLines,
   computeEquipotentialContours,
   computeUniformEquipotentialContours,
+  computeCapacitorEquipotentialContours,
 } from '../physics/electrostatics';
 
 type CameraPreset = 'top' | 'iso' | 'side';
 
 interface ElectricField3DCanvasProps {
   simulationModel: SimulationModel;
+  isCapacitorMode: boolean;
   charges: PointCharge[];
   selectedChargeId: string | null;
   columns: ChargeColumn[];
@@ -174,6 +178,7 @@ function getChargeColor(q: number): THREE.Color {
 
 export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
   simulationModel,
+  isCapacitorMode,
   charges,
   selectedChargeId,
   columns,
@@ -191,6 +196,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
 
   const propsRef = useRef({
     simulationModel,
+    isCapacitorMode,
     charges,
     selectedChargeId,
     columns,
@@ -206,6 +212,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
   });
   propsRef.current = {
     simulationModel,
+    isCapacitorMode,
     charges,
     selectedChargeId,
     columns,
@@ -409,31 +416,59 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     vAxisArrow.position.y = vAxisSpan + 0.14;
     vAxisGroup.add(vAxisArrow);
 
-    const vTickVolts = [-42000, -28000, -14000, 14000, 28000, 42000];
     const vTickBarGeo = new THREE.BoxGeometry(0.28, 0.035, 0.035);
-    const vAxisSprites: THREE.Sprite[] = [];
-    for (const tv of vTickVolts) {
-      const ty = potentialToHeight(tv);
+
+    const pointVAxisLabelsGroup = new THREE.Group();
+    const pointVAxisSprites: THREE.Sprite[] = [];
+    for (const tv of [-42000, -28000, -14000, 14000, 28000, 42000]) {
+      const ty = potentialToHeight(tv, false);
       const bar1 = new THREE.Mesh(vTickBarGeo, vAxisMat);
       bar1.position.set(0, ty, 0);
-      vAxisGroup.add(bar1);
+      pointVAxisLabelsGroup.add(bar1);
       const bar2 = new THREE.Mesh(vTickBarGeo, vAxisMat);
       bar2.rotation.y = Math.PI / 2;
       bar2.position.set(0, ty, 0);
-      vAxisGroup.add(bar2);
+      pointVAxisLabelsGroup.add(bar2);
 
       const labelStr = `${tv > 0 ? '+' : '−'}${Math.abs(tv / 1000)} kV`;
       const labelColor = tv > 0 ? '#C2410C' : '#0E7490';
       const spr = createTextSprite(labelStr, labelColor, 28);
       spr.position.set(-0.82, ty, 0);
-      vAxisGroup.add(spr);
-      vAxisSprites.push(spr);
+      pointVAxisLabelsGroup.add(spr);
+      pointVAxisSprites.push(spr);
     }
+    const pointVTitle = createTextSprite('V [kV]', '#0F172A', 34);
+    pointVTitle.position.set(0, vAxisSpan + 0.55, 0);
+    pointVAxisLabelsGroup.add(pointVTitle);
+    pointVAxisSprites.push(pointVTitle);
+    vAxisGroup.add(pointVAxisLabelsGroup);
 
-    const vTitle = createTextSprite('V [kV]', '#0F172A', 34);
-    vTitle.position.set(0, vAxisSpan + 0.55, 0);
-    vAxisGroup.add(vTitle);
-    vAxisSprites.push(vTitle);
+    const uniformVAxisLabelsGroup = new THREE.Group();
+    const uniformVAxisSprites: THREE.Sprite[] = [];
+    for (const tv of [-200, -150, -100, -50, 50, 100, 150, 200]) {
+      const ty = potentialToHeight(tv, true);
+      const bar1 = new THREE.Mesh(vTickBarGeo, vAxisMat);
+      bar1.position.set(0, ty, 0);
+      uniformVAxisLabelsGroup.add(bar1);
+      const bar2 = new THREE.Mesh(vTickBarGeo, vAxisMat);
+      bar2.rotation.y = Math.PI / 2;
+      bar2.position.set(0, ty, 0);
+      uniformVAxisLabelsGroup.add(bar2);
+
+      const labelStr = `${tv > 0 ? '+' : '−'}${Math.abs(tv)} V`;
+      const labelColor = tv > 0 ? '#C2410C' : '#0E7490';
+      const spr = createTextSprite(labelStr, labelColor, 28);
+      spr.position.set(-0.82, ty, 0);
+      uniformVAxisLabelsGroup.add(spr);
+      uniformVAxisSprites.push(spr);
+    }
+    const uniformVTitle = createTextSprite('V [V]', '#0F172A', 34);
+    uniformVTitle.position.set(0, vAxisSpan + 0.55, 0);
+    uniformVAxisLabelsGroup.add(uniformVTitle);
+    uniformVAxisSprites.push(uniformVTitle);
+    uniformVAxisLabelsGroup.visible = false;
+    vAxisGroup.add(uniformVAxisLabelsGroup);
+
     vAxisGroup.visible = false;
 
     // 7. Dynamic 3D Potential Surface Mesh (hidden overhead, fades in smoothly on rotation)
@@ -467,7 +502,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     scene.add(surfaceMesh);
 
     const surfaceWireMat = new THREE.MeshBasicMaterial({
-      color: 0x94a3b8,
+      color: 0x64748b,
       wireframe: true,
       transparent: true,
       opacity: 0,
@@ -535,6 +570,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     const rebuildPhysics = () => {
       const {
         simulationModel: curModel,
+        isCapacitorMode: curIsCap,
         charges: curCharges,
         selectedChargeId: curSelId,
         columns: curColumns,
@@ -544,8 +580,18 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
       } = propsRef.current;
 
       const isUniform = curModel === 'uniform';
+      const isCap =
+        isUniform &&
+        curIsCap &&
+        curColumns.length === 2 &&
+        curColumns[0].potentialVolts !== undefined &&
+        curColumns[1].potentialVolts !== undefined;
+      const resolvedColumns = isCap
+        ? resolveCapacitorColumns(curColumns)
+        : curColumns;
+
       const activeCharges = curCharges.filter((c) => Math.abs(c.q) >= 0.05);
-      const activeColumns = curColumns.filter((c) => Math.abs(c.q) >= 0.05);
+      const activeColumns = resolvedColumns.filter((c) => Math.abs(c.q) >= 0.05);
       const hasActiveSources = isUniform
         ? activeColumns.length > 0
         : activeCharges.length > 0;
@@ -562,17 +608,19 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
         const wz = posAttr.getZ(i);
         const wy = -wz;
 
-        const v = hasActiveSources
-          ? isUniform
-            ? evaluateUniformPotential(wx, activeColumns)
-            : evaluatePotential(wx, wy, activeCharges)
-          : 0;
-        const h = potentialToHeight(v);
+        const v = isCap
+          ? evaluateCapacitorPotential(wx, resolvedColumns)
+          : hasActiveSources
+            ? isUniform
+              ? evaluateUniformPotential(wx, activeColumns)
+              : evaluatePotential(wx, wy, activeCharges)
+            : 0;
+        const h = potentialToHeight(v, isUniform);
         posAttr.setY(i, h);
         // Only omit 1/r asymptotic caps in point-charge mode; uniform planes stay continuous
         saturatedVerts[i] = !isUniform && Math.abs(h) >= satThreshold ? 1 : 0;
 
-        const norm = Math.tanh(v / 20000);
+        const norm = Math.tanh(v / (isUniform ? 100 : 20000));
         if (norm >= 0) {
           colAttr.setXYZ(
             i,
@@ -627,11 +675,13 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
       }
 
       if (curShowEq && hasActiveSources) {
-        const contours = isUniform
-          ? computeUniformEquipotentialContours(activeColumns, DOMAIN_BOUNDS)
-          : computeEquipotentialContours(activeCharges, DOMAIN_BOUNDS, 136, 136);
+        const contours = isCap
+          ? computeCapacitorEquipotentialContours(resolvedColumns, DOMAIN_BOUNDS)
+          : isUniform
+            ? computeUniformEquipotentialContours(activeColumns, DOMAIN_BOUNDS)
+            : computeEquipotentialContours(activeCharges, DOMAIN_BOUNDS, 136, 136);
         for (const contour of contours) {
-          const h = potentialToHeight(contour.levelVolts) + 0.015;
+          const h = potentialToHeight(contour.levelVolts, isUniform) + 0.015;
           const segs = contour.segments;
           const pts = new Float32Array((segs.length / 4) * 6);
           let pIdx = 0;
@@ -758,8 +808,9 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
               : evaluateField(ix, iy, activeCharges);
             if (magnitude < 1e-2) continue;
 
-            const strengthNorm =
-              Math.log10(1 + magnitude / 350) / Math.log10(1 + 95000 / 350);
+            const strengthNorm = isUniform
+              ? Math.log10(1 + magnitude / 10) / Math.log10(1 + 400 / 10)
+              : Math.log10(1 + magnitude / 350) / Math.log10(1 + 95000 / 350);
             const clampedNorm = Math.max(0, Math.min(1, strengthNorm));
             const totalLen = 0.25 + clampedNorm * 0.58;
             const shaftLen = Math.max(0.08, totalLen - 0.14);
@@ -825,7 +876,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
       if (isUniform) {
         const colLength = DOMAIN_HALF * 2;
         const sphereCount = DOMAIN_HALF * 2 - 1; // y = -15..+15 every 1m
-        for (const col of curColumns) {
+        for (const col of resolvedColumns) {
           const isSelected = col.id === curSelColId;
           const mainColor = getChargeColor(col.q);
 
@@ -888,9 +939,15 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
             group.add(rimR);
           }
 
-          // Column charge density label sprite (clear of x-axis numbers)
-          const signStr = col.q > 0 ? '+' : col.q < 0 ? '−' : '';
-          const colLabel = `${signStr}${Math.abs(col.q).toFixed(1)}`;
+          // Column label sprite (potential in V for capacitor mode, density otherwise)
+          let colLabel: string;
+          if (isCap && col.potentialVolts !== undefined) {
+            const volts = Math.round(col.potentialVolts);
+            colLabel = volts === 0 ? '0 V' : `${volts > 0 ? '+' : '−'}${Math.abs(volts)} V`;
+          } else {
+            const signStr = col.q > 0 ? '+' : col.q < 0 ? '−' : '';
+            colLabel = `${signStr}${Math.abs(col.q).toFixed(1)}`;
+          }
           const labelSprite = createTextSprite(colLabel, '#0F172A', 30);
           labelSprite.position.set(0, sphereRadius * 2 + 0.34, -2.5);
           group.add(labelSprite);
@@ -1104,8 +1161,8 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
         const rawTilt = THREE.MathUtils.clamp((polarAngle - 0.06) / 0.45, 0, 1);
         const tiltFactor = rawTilt * rawTilt * (3 - 2 * rawTilt);
 
-        const targetSurfaceOpacity = propsRef.current.showPotentialTint ? 0.78 : 0.44;
-        const targetWireOpacity = propsRef.current.showPotentialTint ? 0.06 : 0.11;
+        const targetSurfaceOpacity = propsRef.current.showPotentialTint ? 0.86 : 0.58;
+        const targetWireOpacity = propsRef.current.showPotentialTint ? 0.11 : 0.20;
 
         const show3D = tiltFactor > 0.005;
         surfaceMesh.visible = show3D;
@@ -1113,9 +1170,15 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
         surfaceMat.opacity = targetSurfaceOpacity * tiltFactor;
         surfaceWireMat.opacity = targetWireOpacity * tiltFactor;
 
+        const isUniformCam = propsRef.current.simulationModel === 'uniform';
         vAxisGroup.visible = tiltFactor > 0.01;
+        pointVAxisLabelsGroup.visible = !isUniformCam;
+        uniformVAxisLabelsGroup.visible = isUniformCam;
         vAxisMat.opacity = 0.9 * tiltFactor;
-        for (const spr of vAxisSprites) {
+        for (const spr of pointVAxisSprites) {
+          spr.material.opacity = tiltFactor;
+        }
+        for (const spr of uniformVAxisSprites) {
           spr.material.opacity = tiltFactor;
         }
 
@@ -1356,6 +1419,7 @@ export const ElectricField3DCanvas: React.FC<ElectricField3DCanvasProps> = ({
     sceneRefs.current?.requestRender();
   }, [
     simulationModel,
+    isCapacitorMode,
     charges,
     selectedChargeId,
     columns,

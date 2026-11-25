@@ -29,6 +29,9 @@ function createInitialColumns(presetId: string): ChargeColumn[] {
     id: `column-${preset.id}-${index}-${Date.now()}`,
     x: c.x,
     q: c.q,
+    ...(c.potentialVolts !== undefined
+      ? { potentialVolts: c.potentialVolts }
+      : {}),
   }));
 }
 
@@ -148,11 +151,38 @@ export default function App() {
     setSelectedChargeId(null);
   }, []);
 
-  const handleMoveColumn = useCallback((id: string, x: number) => {
-    setColumns((prev) =>
-      prev.map((col) => (col.id === id ? { ...col, x } : col))
-    );
-  }, []);
+  const handleMoveColumn = useCallback(
+    (id: string, x: number) => {
+      const minGap = snapToInteger ? 1 : 0.5;
+      setColumns((prev) => {
+        const isCap =
+          activeUniformPresetId === 'capacitor' && prev.length === 2;
+        if (isCap) {
+          const moving = prev.find((col) => col.id === id);
+          const other = prev.find((col) => col.id !== id);
+          if (moving && other && Math.abs(x - other.x) < minGap) {
+            const dir =
+              x > other.x
+                ? 1
+                : x < other.x
+                  ? -1
+                  : moving.x >= other.x
+                    ? 1
+                    : -1;
+            let adjusted = other.x + dir * minGap;
+            if (adjusted > 15.5 || adjusted < -15.5) {
+              adjusted = other.x - dir * minGap;
+            }
+            return prev.map((col) =>
+              col.id === id ? { ...col, x: adjusted } : col
+            );
+          }
+        }
+        return prev.map((col) => (col.id === id ? { ...col, x } : col));
+      });
+    },
+    [activeUniformPresetId, snapToInteger]
+  );
 
   const handleQuickAddColumn = useCallback(
     (q: number) => {
@@ -190,6 +220,33 @@ export default function App() {
     [activeUniformPresetId]
   );
 
+  const handleUpdateColumnPotential = useCallback(
+    (id: string, potentialVolts: number) => {
+      const clamped = Math.max(
+        -200,
+        Math.min(200, Math.round(potentialVolts / 10) * 10)
+      );
+      setColumns((prev) =>
+        prev.map((col) =>
+          col.id === id ? { ...col, potentialVolts: clamped } : col
+        )
+      );
+    },
+    []
+  );
+
+  const handleSwapCapacitorPotentials = useCallback(() => {
+    setColumns((prev) => {
+      if (prev.length !== 2) return prev;
+      const v0 = prev[0].potentialVolts ?? 0;
+      const v1 = prev[1].potentialVolts ?? 0;
+      return [
+        { ...prev[0], potentialVolts: v1 },
+        { ...prev[1], potentialVolts: v0 },
+      ];
+    });
+  }, []);
+
   const handleDeleteColumn = useCallback((id: string) => {
     setColumns((prev) => prev.filter((col) => col.id !== id));
     setSelectedColumnId((prevSel) => (prevSel === id ? null : prevSel));
@@ -204,6 +261,11 @@ export default function App() {
     simulationModel === 'uniform' ? UNIFORM_PRESET_SCENARIOS : PRESET_SCENARIOS;
   const currentPresetId =
     simulationModel === 'uniform' ? activeUniformPresetId : activePresetId;
+
+  const isCapacitorMode =
+    simulationModel === 'uniform' &&
+    activeUniformPresetId === 'capacitor' &&
+    columns.length === 2;
 
   return (
     <div className="min-h-dvh lg:h-dvh flex flex-col bg-slate-50 text-slate-900">
@@ -273,6 +335,7 @@ export default function App() {
         <div className="h-[56dvh] min-h-[380px] lg:h-auto lg:flex-1 lg:min-h-0 relative">
           <ElectricField3DCanvas
             simulationModel={simulationModel}
+            isCapacitorMode={isCapacitorMode}
             charges={charges}
             selectedChargeId={activeSelectedId}
             columns={columns}
@@ -290,11 +353,7 @@ export default function App() {
 
         <ControlDeck
           simulationModel={simulationModel}
-          isCapacitorMode={
-            simulationModel === 'uniform' &&
-            activeUniformPresetId === 'capacitor' &&
-            columns.length === 2
-          }
+          isCapacitorMode={isCapacitorMode}
           charges={charges}
           selectedChargeId={activeSelectedId}
           columns={columns}
@@ -314,6 +373,8 @@ export default function App() {
           onClearAllCharges={handleClearAllCharges}
           onQuickAddColumn={handleQuickAddColumn}
           onUpdateColumnQ={handleUpdateColumnQ}
+          onUpdateColumnPotential={handleUpdateColumnPotential}
+          onSwapCapacitorPotentials={handleSwapCapacitorPotentials}
           onDeleteColumn={handleDeleteColumn}
           onClearAllColumns={handleClearAllColumns}
         />
